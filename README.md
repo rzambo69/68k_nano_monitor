@@ -10,3 +10,13 @@ monitor program. My purpose is just to insert simple machine language routine in
 
 As said it would need optimization and some error checking routines for the typed commands and the hex numbers. It's not
 so simple for me and it requires a lot of time. Maybe in the future...
+
+
+<img width="1049" height="624" alt="image" src="https://github.com/user-attachments/assets/fb2ad320-ac64-4d0b-b351-cf61fb4423f5" />
+
+<img width="1049" height="624" alt="image" src="https://github.com/user-attachments/assets/a3aa0b9a-4569-40ed-8cf3-ee031aed76d5" />
+
+<img width="1049" height="624" alt="image" src="https://github.com/user-attachments/assets/fdeda236-7185-41c8-8a6e-2a51eee1b017" />
+
+
+
