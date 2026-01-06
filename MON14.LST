@@ -1,0 +1,1740 @@
+Sections:
+00: "org0001:e00100" (E00100-E00B2A)
+
+
+Source: "MON14.ASM"
+                            	     1: ; vim:noet:sw=8:ts=8:sts=8:ai:syn=asm68k
+                            	     2: ;**************************************************************************
+                            	     3: ;* M68000 Monitor vers. 1.4      (renzo@iol.it)    -    09 Nov 2025
+                            	     4: ;* 
+                            	     5: ;*
+                            	     6: ;* Commands:
+                            	     7: ;*   x - Examine memory location
+                            	     8: ;*   d - Dump memory zone
+                            	     9: ;*   r - Display CPU registers
+                            	    10: ;*   g - Go (execute) at specified address
+                            	    11: ;*   e - Execute subroutine at specified  address
+                            	    12: ;*   f - Fill memory zone with byte value
+                            	    13: ;*   c - Copy memory zone
+                            	    14: ;*   i - Insert/modify memory values
+                            	    15: ;*   q - Exit monitor
+                            	    16: ;*   ? - Help
+                            	    17: ;**************************************************************************
+                            	    18: 
+                            	    19:         include "68000app.inc"
+
+Source: "68000app.inc"
+                            	     1:         include "68000sbc.inc"
+
+Source: "68000sbc.inc"
+                            	     1:         include "memory.inc"
+
+Source: "memory.inc"
+                            	     1: ; vim:noet:sw=8:ts=8:sts=8:ai:syn=asm68k
+                            	     2: 
+                            	     3: ROMSIZE         equ     $010000 ;64KB
+                            	     4: RAMSIZE         equ     $100000 ;1MB
+                            	     5: RAMEND          equ     RAM+RAMSIZE
+                            	     6: INITIAL_SP      equ     RAMEND
+                            	     7: ;-------------------------------------------------------------------------------
+                            	     8: ; Base addresses
+                            	     9: ROM             equ     $000000
+                            	    10: RAM             equ     $E00000
+                            	    11: ;-------------------------------------------------------------------------------
+                            	    12: ; Memory reserved for the system
+                            	    13: SYSMEMSTART     equ     RAM
+                            	    14: SYSMEMSIZE      equ     256
+                            	    15:                 rsset	SYSMEMSTART
+                            	    16: OUTCH_VEC       rs.l    1
+                            	    17: INCH_VEC        rs.l    1
+                            	    18: HEXDIGITS       rs.l    1
+                            	    19: SEPARATORS      rs.l    1
+                            	    20: DATE_SEP        equ     SEPARATORS
+                            	    21: TIME_SEP        equ     SEPARATORS+1
+                            	    22: THOUSANDS_SEP   equ     SEPARATORS+2
+                            	    23: 
+                            	    24: ; Mounted filesystem parameters
+                            	    25: PARTSIZE        rs.l    1               ; size of the partition in sectors, 0 = not mounted (4 bytes)
+                            	    26: BPBSECTOR       rs.l    1               ; sector number of the partition's BIOS Parameter Block (4 bytes)
+                            	    27: ; These parameters are in reverse order of those in the BPB,
+                            	    28: ; because they are little-endian quantities that need to be byte-swapped
+                            	    29: FATSIZE         rs.w    1               ; size of a FAT in sectors (2 bytes)
+                            	    30: MAXRDIRENTS     rs.w    1               ; maximum number of root directory entries (2 bytes)
+                            	    31: FATCOPIES       rs.w    1               ; number of FATs (padded to 2 bytes)
+                            	    32: RSVDSECTORS     rs.w    1               ; number of reserved sectors (2 bytes)
+                            	    33: CLUSTERSIZE     rs.w    1               ; number of sectors per cluster (2 bytes)
+                            	    34: RDIRSECTOR      rs.l    1               ; sector number of root directory table (4 bytes)
+                            	    35: FATSECTOR       rs.l    1               ; sector number of FAT #1 (4 bytes)
+                            	    36: DATASTART       rs.l    1               ; sector number of data region start (4 bytes)
+                            	    37: VOLNAME         rs.b    12              ; volume label (11 bytes, one extra for padding)
+                            	    38: FSVARSTART      equ     PARTSIZE
+                            	    39: FSVARLEN        equ     VOLNAME-FSVARSTART+12
+                            	    40: 
+                            	    41: INPUTBUFLEN     equ     64
+                            	    42: INPUTBUF        rs.b    INPUTBUFLEN+2   ; command input buffer
+                            	    43: 
+                            	    44: ;-------------------------------------------------------------------------------
+                            	    45: ; Application programs can be loaded here
+                            	    46: APPMEMSTART    equ     SYSMEMSTART+SYSMEMSIZE
+                            	    47: 
+                            	    48: 
+
+Source: "68000sbc.inc"
+                            	     2:         include "macros.inc"
+
+Source: "macros.inc"
+                            	     1: ; breakpoint (68000 does not have the BKPT instruction)
+                            	     2: brk             macro
+                            	     3:                 trap    #15
+                            	     4:                 endm
+                            	     5: 
+                            	     6: ; set overflow flag
+                            	     7: sev             macro
+                            	     8:                 or      #%00000010,ccr
+                            	     9:                 endm
+                            	    10: 
+                            	    11: ; clear overflow flag
+                            	    12: clv             macro
+                            	    13:                 and     #%11111101,ccr
+                            	    14:                 endm
+                            	    15: 
+                            	    16: ; convenience alias for saving registers on stack
+                            	    17: pushm           macro
+                            	    18:         if NARG>1
+                            	    19:         fail    multiple args passed to pushm--did you use a comma instead of a slash?
+                            	    20:         endif
+                            	    21:                 movem.l \1,-(sp)
+                            	    22:                 endm
+                            	    23: push            macro
+                            	    24:         if NARG>1
+                            	    25:         fail    multiple args passed to push--use pushm if you want to push multiple registers
+                            	    26:         endif
+                            	    27:                 move.l  \1,-(sp)
+                            	    28:                 endm
+                            	    29: 
+                            	    30: ; convenience alias for restoring registers from stack
+                            	    31: popm            macro
+                            	    32:         if NARG>1
+                            	    33:         fail    multiple args passed to popm--did you use a comma instead of a slash?
+                            	    34:         endif
+                            	    35:                 movem.l (sp)+,\1
+                            	    36:                 endm
+                            	    37: pop             macro
+                            	    38:         if NARG>1
+                            	    39:         fail    multiple args passed to pop--use popm if you want to pop multiple registers
+                            	    40:         endif
+                            	    41:                 move.l  (sp)+,\1
+                            	    42:                 endm
+                            	    43: 
+                            	    44: ; Branch to subroutine and link, storing return address in A6.
+                            	    45: ; (An optimization for calling leaf functions, a la Arm)
+                            	    46: bl              macro
+                            	    47:                 lea     (.ret\@,pc),a6
+                            	    48:                 bra     \1
+                            	    49: .ret\@:
+                            	    50:                 endm
+                            	    51: 
+                            	    52: ; Spin for a given number of iterations. (0-65535)
+                            	    53: ; (clobbers d0)
+                            	    54: spin            macro
+                            	    55:                 move.l  #\1,d0
+                            	    56: .spin\@:        dbra    d0,.spin\@
+                            	    57:                 endm
+                            	    58: 
+                            	    59: ; Return from subroutine to address in A6.
+                            	    60: rl              macro
+                            	    61:                 jmp     (a6)
+                            	    62:                 endm
+                            	    63: 
+                            	    64: ; Declare null-terminated string.
+                            	    65: asciz           macro
+                            	    66:                 rept    \#
+                            	    67:                 dc.b    \+
+                            	    68:                 endr
+                            	    69:                 dc.b    0
+                            	    70:                 even
+                            	    71:                 endm
+                            	    72: 
+                            	    73: ; Declare null-terminated string inline, place its address in A0, and jump
+                            	    74: ; over it.
+                            	    75: litstr          macro
+                            	    76:                 lea.l   (.str\@,pc),a0
+                            	    77:                 bra     .next\@
+                            	    78: .str\@:
+                            	    79:                 rept    \#
+                            	    80:                 dc.b    \+
+                            	    81:                 endr
+                            	    82:                 dc.b    0
+                            	    83:                 even
+                            	    84: .next\@:
+                            	    85:                 endm
+                            	    86: 
+                            	    87: ; Status register bit offsets
+                            	    88: SR_C            equ     0       ; carry flag
+                            	    89: SR_V            equ     1       ; overflow flag
+                            	    90: SR_Z            equ     2       ; zero flag
+                            	    91: SR_N            equ     3       ; negative flag
+                            	    92: SR_X            equ     4       ; extend flag
+                            	    93: SR_I            equ     8       ; interrupt mask
+                            	    94: SR_S            equ     13      ; supervisor mode flag
+                            	    95: SR_T            equ     15      ; trace flag
+                            	    96: ; Condition code register (lower byte of status register) bit offsets
+                            	    97: CCR_C           equ     SR_C
+                            	    98: CCR_V           equ     SR_V
+                            	    99: CCR_Z           equ     SR_Z
+                            	   100: CCR_N           equ     SR_N
+                            	   101: CCR_X           equ     SR_X
+                            	   102: 
+                            	   103: LOUD_NOISES     macro
+                            	   104:                 move.l  #$d0d0dd00,d0
+                            	   105:                 move.l  #$d1d1dd11,d1
+                            	   106:                 move.l  #$d2d2dd22,d2
+                            	   107:                 move.l  #$d3d3dd33,d3
+                            	   108:                 move.l  #$d4d4dd44,d4
+                            	   109:                 move.l  #$d5d5dd55,d5
+                            	   110:                 move.l  #$d6d6dd66,d6
+                            	   111:                 move.l  #$d7d7dd77,d7
+                            	   112:                 move.l  #$a0a0aa00,a0
+                            	   113:                 move.l  #$a1a1aa11,a1
+                            	   114:                 move.l  #$a2a2aa22,a2
+                            	   115:                 move.l  #$a3a3aa33,a3
+                            	   116:                 move.l  #$a4a4aa44,a4
+                            	   117:                 move.l  #$a5a5aa55,a5
+                            	   118:                 move.l  #$a6a6aa66,a6
+                            	   119:                 endm
+
+Source: "68000sbc.inc"
+                            	     3:         include "uart.inc"
+
+Source: "uart.inc"
+                            	     1: ; vim:noet:sw=8:ts=8:sts=8:ai:syn=asm68k
+                            	     2: 
+                            	     3: ; base address
+                            	     4: UART            equ $A00000
+                            	     5: 
+                            	     6: ; register offsets
+                            	     7: RHR             equ 0   ; receive holding register (read)
+                            	     8: THR             equ 0   ; transmit holding register (write)
+                            	     9: IER             equ 2   ; interrupt enable register
+                            	    10: ISR             equ 4   ; interrupt status register (read)
+                            	    11: FCR             equ 4   ; FIFO control register (write)
+                            	    12: LCR             equ 6   ; line control register
+                            	    13: MCR             equ 8   ; modem control register
+                            	    14: LSR             equ 10  ; line status register
+                            	    15: MSR             equ 12  ; modem status register
+                            	    16: SPR             equ 14  ; scratchpad register (reserved for system use)
+                            	    17: DLL             equ 0   ; divisor latch LSB
+                            	    18: DLM             equ 2   ; divisor latch MSB
+                            	    19: ; aliases for register names (used by different manufacturers)
+                            	    20: RBR             equ RHR ; receive buffer register
+                            	    21: IIR             equ ISR ; interrupt identification register
+                            	    22: SCR             equ SPR ; scratch register
+                            	    23: 
+                            	    24: ; MCR register bits (output lines)
+                            	    25: ; A bit value of 1 drives the output low
+                            	    26: MCR_COPI        equ 0   ; ~DTR -- bit 0 allows for easier shifting
+                            	    27: MCR_LED         equ 1   ; ~RTS
+                            	    28: MCR_CLK         equ 2   ; ~OUT1
+                            	    29: MCR_nSS         equ 3   ; ~OUT2
+                            	    30: 
+                            	    31: ; MSR register bits (input lines)
+                            	    32: MSR_BTN1        equ 6   ; ~RI
+                            	    33: MSR_BTN1_PRESS  equ 2   ; TERI
+                            	    34: MSR_SQW         equ 5   ; ~DSR
+                            	    35: MSR_SQW_CHG     equ 2   ; deltaDSR
+                            	    36: MSR_CIPO        equ 7   ; ~DSR -- bit 7 allows for easier shifting
+                            	    37: 
+                            	    38: ; Wait for the UART to become ready to transmit a character.
+                            	    39: ; Macro argument 1: register containing the UART base address
+                            	    40: tx_wait         macro
+                            	    41: .t\@!:          btst.b  #5,LSR(\1)
+                            	    42:                 beq     .t\@@
+                            	    43:                 endm
+                            	    44: 
+                            	    45: ; Transmit a character on the serial port.
+                            	    46: ; Macro argument 1: effective address of value to transmit
+                            	    47: ; Macro argument 2: register containing the UART base address
+                            	    48: tx_char         macro
+                            	    49:                 tx_wait \2
+                            	    50:                 move.b  \1,THR(\2)
+                            	    51:                 endm
+                            	    52: 
+                            	    53: led_on          macro
+                            	    54:                 bset.b  #MCR_LED,UART+MCR
+                            	    55:                 endm
+                            	    56: 
+                            	    57: led_off         macro
+                            	    58:                 bclr.b  #MCR_LED,UART+MCR
+                            	    59:                 endm
+                            	    60: 
+                            	    61: led_tgl         macro
+                            	    62:                 bchg.b  #MCR_LED,UART+MCR
+                            	    63:                 endm
+
+Source: "68000sbc.inc"
+                            	     4:         include "cfcard.inc"
+
+Source: "cfcard.inc"
+                            	     1: ; vim:noet:sw=8:ts=8:sts=8:ai:syn=asm68k
+                            	     2: 
+                            	     3: ; base address
+                            	     4: CFCARD          equ     $900000
+                            	     5: 
+                            	     6: ; task file register offsets
+                            	     7: CF_DATA         equ     0       ; data register (16-bit read/write)
+                            	     8: CF_ERROR        equ     3       ; error register (8-bit read)
+                            	     9: CF_FEATURE      equ     3       ; feature register (8-bit write)
+                            	    10: CF_COUNT        equ     5       ; sector count register (8-bit read/write)
+                            	    11: CF_SECTOR       equ     7       ; sector number register (8-bit read/write)
+                            	    12: CF_LBA0         equ     7       ;  also, LBA bits 7-0
+                            	    13: CF_CYLL         equ     9       ; cylinder low register (8-bit read/write)
+                            	    14: CF_LBA1         equ     9       ;  also, LBA bits 15-8
+                            	    15: CF_CYLH         equ     11      ; cylinder high register (8-bit read/write)
+                            	    16: CF_LBA2         equ     11      ;  also, LBA bits 23-16
+                            	    17: CF_DRIVEHEAD    equ     13      ; drive select/head register (8-bit read/write)
+                            	    18: CF_LBA3         equ     13      ;  also, LBA bits 27-24
+                            	    19: CF_STATUS       equ     15      ; status register (8-bit read)
+                            	    20: CF_COMMAND      equ     15      ; command register (8-bit write)
+                            	    21: 
+                            	    22: ; task file register offsets for word access
+                            	    23: CF_ERROR_W      equ     CF_ERROR-1
+                            	    24: CF_FEATURE_W    equ     CF_FEATURE-1
+                            	    25: CF_COUNT_W      equ     CF_COUNT-1
+                            	    26: CF_SECTOR_W     equ     CF_SECTOR-1
+                            	    27: CF_LBA0_W       equ     CF_LBA0-1
+                            	    28: CF_CYLL_W       equ     CF_CYLL-1
+                            	    29: CF_LBA1_W       equ     CF_LBA1-1
+                            	    30: CF_CYLH_W       equ     CF_CYLH-1
+                            	    31: CF_LBA2_W       equ     CF_LBA2-1
+                            	    32: CF_DRIVEHEAD_W  equ     CF_DRIVEHEAD-1
+                            	    33: CF_LBA3_W       equ     CF_LBA3-1
+                            	    34: CF_STATUS_W     equ     CF_STATUS-1
+                            	    35: CF_COMMAND_W    equ     CF_COMMAND-1
+                            	    36: 
+                            	    37: ; commands
+                            	    38: CFCMD_IDENTIFY  equ     $EC
+                            	    39: CFCMD_RDSECTOR  equ     $20
+                            	    40: 
+                            	    41: ; errors
+                            	    42: ; if bit 5 is clear, it's an error reported by the card
+                            	    43: ; if bit 5 is set, it's a filesystem error
+                            	    44: FSERR_TIMEOUT   equ     32      ; no card detected
+                            	    45: FSERR_WRONGTYPE equ     33      ; filesystem is not FAT16
+                            	    46: FSERR_BPS       equ     34      ; bytes per sector is not 512
+                            	    47: FSERR_NMOUNTED  equ     35      ; filesystem not mounted
+                            	    48: FSERR_NOTFOUND  equ     36      ; file not found
+                            	    49: FSERR_INVCLSTR  equ     37      ; invalid cluster number
+                            	    50: FSERR_BADSECTOR equ     38      ; cluster contains a bad sector
+                            	    51: FSERR_INVNAME   equ     39      ; invalid filename
+                            	    52: FSERR_ISDIR     equ     40      ; file is a directory
+                            	    53: 
+                            	    54: ; Size of a sector. Hardcoded.
+                            	    55: ; Drives with a different sector size are not supported.
+                            	    56: SECTORSIZE      equ     512
+                            	    57: ; Size of the buffer required for directory listing
+                            	    58: DIRBUFSIZE      equ     SECTORSIZE+8
+                            	    59: ; Size of a FAT16 directory entry
+                            	    60: DIRENTLEN       equ     32
+                            	    61: 
+                            	    62: ; FAT16 directory entry field offsets
+                            	    63: FNAME           equ     0
+                            	    64: FNAMELEN        equ     11
+                            	    65: FATTRS          equ     11
+                            	    66: FCLUSTER        equ     26
+                            	    67: FSIZE           equ     28
+                            	    68: 
+
+Source: "68000sbc.inc"
+                            	     5:         include "syscalls.inc"
+
+Source: "syscalls.inc"
+                            	     1: ; Calling conventions for system routines
+                            	     2: ;-------------------------------------------------------------------------------
+                            	     3: ; D0-D1 - integer arguments
+                            	     4: ; A0-A1 - pointer arguments
+                            	     5: ; Additional arguments passed on the stack.
+                            	     6: ;
+                            	     7: ; D0-D1 - integer return values
+                            	     8: ; A0-A1 - pointer return values
+                            	     9: ; D2-D7 - preserved
+                            	    10: ; A2-A7 - preserved
+                            	    11: ; SR    - preserved
+                            	    12: ;
+                            	    13: ; Registers D0-D1/A0-A1 not used for return values may have undefined contents
+                            	    14: ; upon return to the caller. (i.e. the callee may use them as scratch registers)
+                            	    15: ;
+                            	    16: ; The caller is responsible for removing arguments passed on the stack.
+                            	    17: ;
+                            	    18: Exit            equ     0
+                            	    19: WaitBtn         equ     1
+                            	    20: OutChar         equ     2
+                            	    21: OutStr          equ     3
+                            	    22: OutFmt          equ     4
+                            	    23: InChar          equ     5
+                            	    24: PromptStr       equ     6
+                            	    25: ReadSector      equ     7
+                            	    26: ListDirectory   equ     8
+                            	    27: FindFile        equ     9
+                            	    28: ReadFile        equ     10
+                            	    29: GetDateTime     equ     11
+                            	    30: SetDateTime     equ     12
+                            	    31: GetSysInfo      equ     13
+                            	    32: ; 14 - reserved for future use
+                            	    33: Breakpoint      equ     15
+                            	    34: 
+                            	    35: 
+                            	    36: ; Syscall macro.
+                            	    37: sys             macro
+                            	    38:                 trap    #\1
+                            	    39:                 endm
+                            	    40: 
+                            	    41: ; format specifiers for OutFmt
+                            	    42: FMT_BASE        equ     $E0
+                            	    43: FMT_C           equ     FMT_BASE+0      ;pop word and print lsb as an ASCII character
+                            	    44: FMT_C2          equ     FMT_BASE+1      ;pop word and print as two ASCII characters
+                            	    45: FMT_C4          equ     FMT_BASE+2      ;pop longword and print as four ASCII characters
+                            	    46: FMT_H8          equ     FMT_BASE+3      ;pop word and print lsb as two hex digits
+                            	    47: FMT_H16         equ     FMT_BASE+4      ;pop word and print as four hex digits
+                            	    48: FMT_H32         equ     FMT_BASE+5      ;pop longword and print as eight hex digits
+                            	    49: FMT_S           equ     FMT_BASE+6      ;pop longword and print null-terminated ASCII string at address
+                            	    50: FMT_U8          equ     FMT_BASE+7      ;pop word and print lsb as 1-3 decimal digits (unsigned)
+                            	    51: FMT_U16         equ     FMT_BASE+8      ;pop word and print as 1-5 decimal digits (unsigned)
+                            	    52: FMT_U32         equ     FMT_BASE+9      ;pop longword and print as 1-10 decimal digits (unsigned)
+                            	    53: FMT_D8          equ     FMT_BASE+10     ;pop word and print lsb as 1-3 decimal digits (signed)
+                            	    54: FMT_D16         equ     FMT_BASE+11     ;pop word and print as 1-5 decimal digits (signed)
+                            	    55: FMT_D32         equ     FMT_BASE+12     ;pop longword and print as 1-10 decimal digits (signed)
+                            	    56: FMT_Z8          equ     FMT_BASE+13     ;pop word and print lsb as 5 decimal digits with leading zeros (unsigned)
+                            	    57: FMT_Z16         equ     FMT_BASE+14     ;pop word and print as 3 decimal digits with leading zeros (unsigned)
+                            	    58: FMT_Z32         equ     FMT_BASE+15     ;pop longword and print as 10 decimal digits with leading zeros (unsigned)
+                            	    59: FMT_SRFLAGS     equ     FMT_BASE+16     ;pop word and print as status register flags
+                            	    60: FMT_FAULTFLAGS  equ     FMT_BASE+17     ;pop word and print as bus/address error fault flags
+                            	    61: FMT_DATE        equ     FMT_BASE+18     ;pop longword and print as date (YYYY/MM/DD)
+                            	    62: FMT_TIME        equ     FMT_BASE+19     ;pop longword and print as time (HH:MM:SS)
+                            	    63: FMT_HEXDUMP     equ     FMT_BASE+20     ;pop longword length and longword address, print as hex dump
+                            	    64: FMT_BUF         equ     FMT_BASE+21     ;pop longword length and longword address, print as ASCII
+                            	    65: FMT_FNAME       equ     FMT_BASE+22     ;pop longword address and print 11 characters as a decoded filename
+                            	    66: FMT_ERR         equ     FMT_BASE+23     ;pop word and print description of the error code in the lsb
+                            	    67: 
+                            	    68: ; option flags for PromptStr
+                            	    69: PRbNOECHO       equ     8
+                            	    70: PRbNOCTRLCHARS  equ     9
+                            	    71: 
+                            	    72: PR_NOECHO       equ     (1<<PRbNOECHO)          ;do not echo characters received to output device
+                            	    73: PR_NOCTRLCHARS  equ     (1<<PRbNOCTRLCHARS)     ;do not interpret control characters
+                            	    74: 
+
+Source: "68000app.inc"
+                            	     2:         org     APPMEMSTART
+                            	     3: 
+
+Source: "MON14.ASM"
+                            	    20: 
+00:00E00100 00              	    21: KEYB_BUFF	DS.B	64
+00:00E00101 *
+                            	    22: CR		EQU 	$0D
+                            	    23: LF		EQU	$0A
+                            	    24: 
+00:00E00140 00000000        	    25: REG_D0		DS.L	1
+00:00E00144 00000000        	    26: REG_D1		DS.L	1
+00:00E00148 00000000        	    27: REG_D2		DS.L	1
+00:00E0014C 00000000        	    28: REG_D3		DS.L	1
+00:00E00150 00000000        	    29: REG_D4		DS.L	1
+00:00E00154 00000000        	    30: REG_D5		DS.L	1
+00:00E00158 00000000        	    31: REG_D6		DS.L	1
+00:00E0015C 00000000        	    32: REG_D7		DS.L	1
+00:00E00160 00000000        	    33: REG_A0		DS.L	1
+00:00E00164 00000000        	    34: REG_A1		DS.L	1
+00:00E00168 00000000        	    35: REG_A2		DS.L	1
+00:00E0016C 00000000        	    36: REG_A3		DS.L	1
+00:00E00170 00000000        	    37: REG_A4		DS.L	1
+00:00E00174 00000000        	    38: REG_A5		DS.L	1
+00:00E00178 00000000        	    39: REG_A6		DS.L	1
+00:00E0017C 00000000        	    40: REG_A7		DS.L	1
+                            	    41: 
+                            	    42: 
+00:00E00180 41FA049E        	    43: START:          lea.l   INIT_MESSAGE,a0
+                            	    44:                 sys     OutStr
+00:00E00184 4E43            	     1M                 trap    #OutStr
+                            	    45: 
+00:00E00186 61000478        	    46: MAIN_LOOP:      bsr	INIT_REGS
+00:00E0018A 41FA04FC        	    47: 		lea.l   PROMPT,a0
+                            	    48: 		sys	OutStr
+00:00E0018E 4E43            	     1M                 trap    #OutStr
+                            	    49: 
+00:00E00190 41FAFF6E        	    50: 		lea.l	KEYB_BUFF,A0
+00:00E00194 703F            	    51: 		moveq	#$3F,D0		; max length 63 char
+00:00E00196 720A            	    52: 		moveq	#$0A,D1		; stop when newline char is received
+                            	    53: 		sys	PromptStr
+00:00E00198 4E46            	     1M                 trap    #PromptStr
+                            	    54: 
+                            	    55: ; converte i caratteri inseriti in maiuscolo
+                            	    56: 
+00:00E0019A 41FAFF64        	    57: 		lea.l	KEYB_BUFF,A0
+00:00E0019E 1010            	    58: CAPS1:		move.b	(A0),D0
+00:00E001A0 6100044C        	    59: 		bsr	TO_UPPER
+00:00E001A4 1080            	    60: 		move.b	D0,(A0)
+00:00E001A6 4A00            	    61: 		cmp.b	#$00,D0
+00:00E001A8 6704            	    62: 		beq	CHK_MENU
+00:00E001AA 5288            	    63: 		add.l	#$01,A0
+00:00E001AC 60F0            	    64: 		bra	CAPS1
+                            	    65: 
+00:00E001AE 103AFF50        	    66: CHK_MENU:	move.b	(KEYB_BUFF),d0
+00:00E001B2 6100043A        	    67: 		bsr	TO_UPPER
+                            	    68:         
+00:00E001B6 B03C0058        	    69:         	cmp.b   #'X',d0
+00:00E001BA 6752            	    70:         	beq     CMD_EXAMINE      ; Examine memory
+                            	    71:         
+00:00E001BC B03C0044        	    72:         	cmp.b   #'D',d0
+00:00E001C0 670000AA        	    73:         	beq     CMD_DUMP         ; Dump memory
+                            	    74:         
+00:00E001C4 B03C0052        	    75:         	cmp.b   #'R',d0
+00:00E001C8 6700018A        	    76:         	beq     CMD_REGISTERS    ; Display registers
+                            	    77:         
+00:00E001CC B03C0047        	    78:         	cmp.b   #'G',d0
+00:00E001D0 6700018C        	    79:         	beq     CMD_GO           ; Execute code
+                            	    80: 
+00:00E001D4 B03C0045        	    81:         	cmp.b   #'E',d0
+00:00E001D8 670001C0        	    82:         	beq     CMD_GOSUB        ; Execute subroutine code
+                            	    83:         
+00:00E001DC B03C0046        	    84:         	cmp.b   #'F',d0
+00:00E001E0 670001F8        	    85:         	beq    CMD_FILL        ; Fill memory
+                            	    86:         
+00:00E001E4 B03C0043        	    87:         	cmp.b   #'C',d0
+00:00E001E8 6700028E        	    88:         	beq     CMD_COPY        ; Copy memory
+                            	    89:         
+00:00E001EC B03C0049        	    90:         	cmp.b   #'I',d0
+00:00E001F0 67000326        	    91:         	beq     CMD_INSERT      ; Insert/modify memory
+                            	    92: 
+00:00E001F4 B03C0051        	    93:         	cmp.b   #'Q',d0
+00:00E001F8 670003E0        	    94:         	beq     CMD_EXIT      ; Exit monitor
+                            	    95: 
+00:00E001FC B03C003F        	    96:         	cmp.b   #'?',d0
+00:00E00200 670003E0        	    97:         	beq     CMD_HELP      ; Insert/modify memory
+                            	    98:         
+00:00E00204 41FA0486        	    99:         	lea.l     UNKNOWN_CMD,a0
+                            	   100:         	sys	OutStr	       ; Unknown command
+00:00E00208 4E43            	     1M                 trap    #OutStr
+00:00E0020A 6000FF7A        	   101:         	bra     MAIN_LOOP
+                            	   102: 
+                            	   103: ;**************************************************************************
+                            	   104: ;* Command: Examine Memory (x)
+                            	   105: ;* Syntax: x <address>
+                            	   106: ;* Displays the contents of the specified memory location
+                            	   107: ;**************************************************************************
+                            	   108: 
+00:00E0020E 610003F0        	   109: CMD_EXAMINE:	bsr	INIT_REGS
+00:00E00212 41FA04FC        	   110: 		lea.l	CMD_EXAMINE_MSG,a0
+                            	   111: 		sys	OutStr
+00:00E00216 4E43            	     1M                 trap    #OutStr
+                            	   112: 
+00:00E00218 41FAFEE6        	   113: 		lea.l	KEYB_BUFF,a0
+                            	   114: 		sys	OutStr
+00:00E0021C 4E43            	     1M                 trap    #OutStr
+                            	   115: 
+00:00E0021E 7000            	   116: 		move.l	#$00,D0
+00:00E00220 7200            	   117: 		move.l	#$00,D1
+00:00E00222 7400            	   118: 		move.l	#$00,D2
+00:00E00224 41FAFEDC        	   119: 		lea.l	KEYB_BUFF+2,a0
+00:00E00228 1410            	   120: LX1:		move.b	(a0),D2
+00:00E0022A 5248            	   121: 		add	#$01,A0
+00:00E0022C 4A02            	   122: 		cmp.b	#$00,d2
+00:00E0022E 671C            	   123: 		beq	LX2
+00:00E00230 B43C0020        	   124: 		cmp.b	#$20,d2
+00:00E00234 6716            	   125: 		beq	LX2
+00:00E00236 E981            	   126: 	        asl.l   #4,D1
+                            	   127: 
+00:00E00238 B43C0039        	   128: 	        CMP.B   #'9',D2
+00:00E0023C 6306            	   129: 	        BLS     LX3               ; 0-9
+00:00E0023E 943C0037        	   130: 	        SUB.B   #'A'-10,D2       ; Convert A-F to 10-15
+00:00E00242 6004            	   131: 	        BRA     COMBINE
+                            	   132:         
+00:00E00244 943C0030        	   133: LX3:	        SUB.B   #$30,D2          ; Convert 0-9 to 0-9
+                            	   134:         
+                            	   135: COMBINE:
+00:00E00248 D242            	   136:        		add     D2,D1
+00:00E0024A 60DC            	   137:     	        bra     LX1
+                            	   138: 
+00:00E0024C 2041            	   139: LX2:		move.l	D1,A0
+00:00E0024E 2408            	   140: 		move.l	A0,D2
+00:00E00250 1010            	   141: 		move.b	(A0),D0
+                            	   142: 
+                            	   143: 		;stampa <indirizzo> <byte>
+00:00E00252 3F00            	   144: 		move.w	D0,-(sp)
+00:00E00254 2F01            	   145: 		move.l	D1,-(sp)
+00:00E00256 41FA000A        	   146: 		lea.l	x_fmtstr,a0
+                            	   147: 		sys	OutFmt
+00:00E0025A 4E44            	     1M                 trap    #OutFmt
+00:00E0025C 5C4F            	   148: 		addq	#$06,sp
+                            	   149: 
+00:00E0025E 6000FF26        	   150: 	        bra     MAIN_LOOP
+                            	   151: 
+00:00E00262 0A20202020      	   152: x_fmtstr:	dc.b	"\n    ",FMT_H32," ",FMT_H8,"\n",0
+00:00E00267 E5
+00:00E00268 20
+00:00E00269 E3
+00:00E0026A 0A
+00:00E0026B 00
+                            	   153: 
+                            	   154: ;**************************************************************************
+                            	   155: ;* Command: Dump Memory (d)
+                            	   156: ;* Syntax: d <start> <end>
+                            	   157: ;* Dumps memory from start to end address, 16 bytes per line
+                            	   158: ;**************************************************************************
+00:00E0026C 61000392        	   159: CMD_DUMP:	bsr	INIT_REGS
+00:00E00270 41FA04B2        	   160: 		lea.l	CMD_DUMP_MSG,a0
+                            	   161: 		sys	OutStr
+00:00E00274 4E43            	     1M                 trap    #OutStr
+                            	   162: 
+00:00E00276 41FAFE88        	   163: 		lea.l	KEYB_BUFF,a0
+                            	   164: 		sys	OutStr
+00:00E0027A 4E43            	     1M                 trap    #OutStr
+                            	   165: 
+00:00E0027C 41FA0096        	   166: 		lea.l	DUMP_HEAD,a0
+                            	   167: 		sys	OutStr
+00:00E00280 4E43            	     1M                 trap    #OutStr
+                            	   168: 
+00:00E00282 7000            	   169: 		move.l	#$00,D0
+00:00E00284 7200            	   170: 		move.l	#$00,D1
+00:00E00286 7400            	   171: 		move.l	#$00,D2
+                            	   172: 
+00:00E00288 41FAFE78        	   173: 		lea.l	KEYB_BUFF+2,a0
+00:00E0028C 1410            	   174: LD1:		move.b	(a0),D2
+00:00E0028E 5248            	   175: 		add	#$01,A0
+00:00E00290 B43C0020        	   176: 		cmp.b	#$20,d2
+00:00E00294 6716            	   177: 		beq	LD2
+00:00E00296 E981            	   178: 	        asl.l   #4,D1
+                            	   179: 
+00:00E00298 B43C0039        	   180: 	        CMP.B   #'9',D2
+00:00E0029C 6306            	   181: 	        BLS     LD3               ; 0-9
+00:00E0029E 943C0037        	   182: 	        SUB.B   #'A'-10,D2       ; Convert A-F to 10-15
+00:00E002A2 6004            	   183: 	        BRA     COMBINE_D
+                            	   184:         
+00:00E002A4 943C0030        	   185: LD3:	        SUB.B   #$30,D2          ; Convert 0-9 to 0-9
+                            	   186:         
+                            	   187: COMBINE_D:
+00:00E002A8 D242            	   188:        		add     D2,D1
+00:00E002AA 60E0            	   189:     	        bra     LD1
+                            	   190: 
+00:00E002AC 2A41            	   191: LD2:		move.l	D1,A5		; salva indirizzo inizio dump in A5
+                            	   192: 
+                            	   193: ; legge indirizzo fine
+00:00E002AE 7000            	   194: 		move.l	#$00,D0
+00:00E002B0 7200            	   195: 		move.l	#$00,D1
+00:00E002B2 7400            	   196: 		move.l	#$00,D2
+                            	   197: 
+00:00E002B4 2448            	   198: 		move.l	a0,a2
+00:00E002B6 1412            	   199: LD4:		move.b	(a2),D2
+00:00E002B8 524A            	   200: 		add	#$01,A2
+00:00E002BA 4A02            	   201: 		cmp.b	#$00,d2
+00:00E002BC 671C            	   202: 		beq	LD5
+00:00E002BE B43C0020        	   203: 		cmp.b	#$20,d2
+00:00E002C2 6716            	   204: 		beq	LD5
+00:00E002C4 E981            	   205: 	        asl.l   #4,D1
+                            	   206: 
+00:00E002C6 B43C0039        	   207: 	        CMP.B   #'9',D2
+00:00E002CA 6306            	   208: 	        BLS     LD6               ; 0-9
+00:00E002CC 943C0037        	   209: 	        SUB.B   #'A'-10,D2       ; Convert A-F to 10-15
+00:00E002D0 6004            	   210: 	        BRA     COMBINE_D2
+                            	   211:         
+00:00E002D2 943C0030        	   212: LD6:	        SUB.B   #$30,D2          ; Convert 0-9 to 0-9
+                            	   213:         
+                            	   214: COMBINE_D2:
+00:00E002D6 D242            	   215:        		add     D2,D1
+00:00E002D8 60DC            	   216:     	        bra     LD4
+                            	   217: 
+00:00E002DA 2C41            	   218: LD5:		move.l	D1,A6	; salva indirizzo fine dump in A6
+00:00E002DC 2801            	   219: 		move.l	D1,D4	; e in D4
+                            	   220: 
+                            	   221: ;stampa da inizio a fine il dump su righe di 16 byte
+                            	   222: 
+00:00E002DE 200D            	   223: D_START:	move.l	A5,d0
+00:00E002E0 7600            	   224: 		move.l	#$00,d3		; i=0
+                            	   225: 
+00:00E002E2 2F00            	   226: 		move.l	D0,-(sp)	;print address
+00:00E002E4 41FA0068        	   227: 		lea.l	ad_fmtstr,a0
+                            	   228: 		sys	OutFmt
+00:00E002E8 4E44            	     1M                 trap    #OutFmt
+00:00E002EA 584F            	   229: 		addq	#$04,sp
+                            	   230: 
+00:00E002EC 1015            	   231: D_PR_BYTE	move.b	(A5),d0		;print byte
+00:00E002EE 3F00            	   232: 		move.w	d0,-(sp)
+00:00E002F0 41FA005F        	   233: 		lea.l	da_fmtstr,a0
+                            	   234: 		sys	OutFmt
+00:00E002F4 4E44            	     1M                 trap    #OutFmt
+00:00E002F6 544F            	   235: 		addq	#2,sp
+                            	   236: 
+00:00E002F8 5243            	   237: 		addq	#$01,d3		; i=i+1
+                            	   238: 
+00:00E002FA 2A0D            	   239: 		move.l	A5,D5
+00:00E002FC BA84            	   240: 		cmp.l	D4,D5		; address > end_address?
+00:00E002FE 6C0A            	   241: 		bge	D_END		;if yes go to end of dump routine
+00:00E00300 524D            	   242: 		addq	#$01,A5		; address = address + 1
+                            	   243: 
+00:00E00302 B67C0010        	   244: 		cmp	#$10,d3		; i=16?
+00:00E00306 66E4            	   245: 		bne	D_PR_BYTE	; if false print next byte
+00:00E00308 60D4            	   246: 		bra	D_START
+                            	   247: 
+00:00E0030A 41FA081C        	   248: D_END		lea.l	ACAPO,a0	; print new line char and return to main prompt
+                            	   249: 		sys	OutStr
+00:00E0030E 4E43            	     1M                 trap    #OutStr
+00:00E00310 6000FE74        	   250: 	        bra     MAIN_LOOP
+                            	   251: 
+00:00E00314 0A20202020202020	   252: DUMP_HEAD:	dc.b	"\n         00 01 02 03 04 05 06 07 08 09 0A 0B 0C 0D 0E 0F",0
+00:00E0031C 2020303020303120
+00:00E00324 3032203033203034
+00:00E0032C 2030352030362030
+00:00E00334 3720303820303920
+00:00E0033C 3041203042203043
+00:00E00344 2030442030452030
+00:00E0034C 46
+00:00E0034D 00
+00:00E0034E 0A              	   253: ad_fmtstr:	dc.b	"\n",FMT_H32,0
+00:00E0034F E5
+00:00E00350 00
+00:00E00351 20              	   254: da_fmtstr:	dc.b	" ",FMT_H8,0
+00:00E00352 E3
+00:00E00353 00
+                            	   255: 
+                            	   256: 
+                            	   257: ;**************************************************************************
+                            	   258: ;* Command: Display Registers (r)
+                            	   259: ;* Displays the contents of all CPU registers
+                            	   260: ;**************************************************************************
+                            	   261: CMD_REGISTERS:	;salva PC
+                            	   262: 		;salva Status Register
+                            	   263: 
+                            	   264: ;		move.l	D0,REG_D0
+                            	   265: ;		move.l	D1,REG_D1
+                            	   266: ;		move.l	D2,REG_D2
+                            	   267: ;		move.l	D3,REG_D3
+                            	   268: ;		move.l	D4,REG_D4
+                            	   269: ;		move.l	D5,REG_D5
+                            	   270: ;		move.l	D6,REG_D6
+                            	   271: ;		move.l	D7,REG_D7
+                            	   272: ;		move.l	A0,REG_A0
+                            	   273: ;		move.l	A1,REG_A1
+                            	   274: ;		move.l	A2,REG_A2
+                            	   275: ;		move.l	A3,REG_A3
+                            	   276: ;		move.l	A4,REG_A4
+                            	   277: ;		move.l	A5,REG_A5
+                            	   278: ;		move.l	A6,REG_A6
+                            	   279: ;		move.l	A7,REG_A7
+                            	   280: 
+00:00E00354 41FA03DF        	   281: 		lea.l	CMD_REGISTERS_MSG,a0
+                            	   282: 		sys	OutStr
+00:00E00358 4E43            	     1M                 trap    #OutStr
+                            	   283: 
+                            	   284: ; stampa a video i registri
+                            	   285: 
+00:00E0035A 6000FE2A        	   286: 	        bra     MAIN_LOOP
+                            	   287: 
+                            	   288: ;**************************************************************************
+                            	   289: ;* Command: Go (g)
+                            	   290: ;* Syntax: g <address>
+                            	   291: ;* Begins execution at the specified address
+                            	   292: ;**************************************************************************
+00:00E0035E 610002A0        	   293: CMD_GO:		bsr	INIT_REGS
+00:00E00362 41FA03E6        	   294: 		lea.l	CMD_GO_MSG,a0
+                            	   295: 		sys	OutStr
+00:00E00366 4E43            	     1M                 trap    #OutStr
+                            	   296: 
+00:00E00368 7000            	   297: 		move.l	#$00,D0
+00:00E0036A 7200            	   298: 	    	move.l	#$00,D1
+00:00E0036C 7400            	   299: 	        move.l	#$00,D2
+                            	   300: 
+00:00E0036E 41FAFD92        	   301:     		lea.l	KEYB_BUFF+2,a0
+                            	   302: 
+00:00E00372 1410            	   303: LG1:		move.b	(a0),D2
+00:00E00374 5248            	   304: 		add     #$01,A0
+00:00E00376 B43C0020        	   305: 	    	cmp.b	#$20,d2
+00:00E0037A 671A            	   306: 	    	beq     LG2
+00:00E0037C 4A02            	   307: 	    	cmp.b	#$00,d2
+00:00E0037E 6716            	   308: 	    	beq     LG2
+00:00E00380 E981            	   309: 	        asl.l   #4,D1
+                            	   310: 
+00:00E00382 B43C0039        	   311: 	        CMP.B   #'9',D2
+00:00E00386 6306            	   312: 	        BLS     LG3               ; 0-9
+00:00E00388 943C0037        	   313: 	        SUB.B   #'A'-10,D2       ; Convert A-F to 10-15
+00:00E0038C 6004            	   314: 	        BRA     COMBINE_G
+                            	   315:         
+00:00E0038E 943C0030        	   316: LG3:	        SUB.B   #$30,D2          ; Convert 0-9 to 0-9
+                            	   317:         
+                            	   318: COMBINE_G:
+00:00E00392 D242            	   319:        		add     D2,D1
+00:00E00394 60DC            	   320: 	        bra     LG1
+                            	   321: 
+00:00E00396 2241            	   322: LG2:		move.l	D1,A1		; salva indirizzo inizio dump in A1
+                            	   323: 
+                            	   324: ; esegue codice a partire da indirizzo contenuto in A1
+                            	   325: 
+00:00E00398 4ED1            	   326: 	        jmp     (A1)
+                            	   327: 
+                            	   328: ;**************************************************************************
+                            	   329: ;* Command: GoSub (e)
+                            	   330: ;* Syntax: e <address>
+                            	   331: ;* Execute subroutine at the specified address
+                            	   332: ;**************************************************************************
+00:00E0039A 61000264        	   333: CMD_GOSUB:	bsr	INIT_REGS
+00:00E0039E 41FA03BE        	   334: 		lea.l	CMD_GOSUB_MSG,a0
+                            	   335: 		sys	OutStr
+00:00E003A2 4E43            	     1M                 trap    #OutStr
+                            	   336: 
+00:00E003A4 7000            	   337: 		move.l	#$00,D0
+00:00E003A6 7200            	   338: 	    	move.l	#$00,D1
+00:00E003A8 7400            	   339: 	        move.l	#$00,D2
+                            	   340: 
+00:00E003AA 41FAFD56        	   341:     		lea.l	KEYB_BUFF+2,a0
+                            	   342: 
+00:00E003AE 1410            	   343: LE1:		move.b	(a0),D2
+00:00E003B0 5248            	   344: 		add     #$01,A0
+00:00E003B2 B43C0020        	   345: 	    	cmp.b	#$20,d2
+00:00E003B6 671A            	   346: 	    	beq     LE2
+00:00E003B8 4A02            	   347: 	    	cmp.b	#$00,d2
+00:00E003BA 6716            	   348: 	    	beq     LE2
+00:00E003BC E981            	   349: 	        asl.l   #4,D1
+                            	   350: 
+00:00E003BE B43C0039        	   351: 	        CMP.B   #'9',D2
+00:00E003C2 6306            	   352: 	        BLS     LE3               ; 0-9
+00:00E003C4 943C0037        	   353: 	        SUB.B   #'A'-10,D2       ; Convert A-F to 10-15
+00:00E003C8 6004            	   354: 	        BRA     COMBINE_E
+                            	   355:         
+00:00E003CA 943C0030        	   356: LE3:	        SUB.B   #$30,D2          ; Convert 0-9 to 0-9
+                            	   357:         
+                            	   358: COMBINE_E:
+00:00E003CE D242            	   359:        		add     D2,D1
+00:00E003D0 60DC            	   360: 	        bra     LE1
+                            	   361: 
+00:00E003D2 2241            	   362: LE2:		move.l	D1,A1		; salva indirizzo inizio dump in A1
+                            	   363: 
+                            	   364: ; esegue la subroutine a partire da indirizzo contenuto in A1 e torna al monitor
+                            	   365: ; quando incontra l'istruzione RTS
+                            	   366: 
+00:00E003D4 4E91            	   367: 	        jsr     (A1)
+                            	   368: 
+00:00E003D6 6000FDAE        	   369: 	        bra     MAIN_LOOP
+                            	   370: 
+                            	   371: ;**************************************************************************
+                            	   372: ;* Command: Fill Memory (f)
+                            	   373: ;* Syntax: f <start_address> <end_address> <byte>
+                            	   374: ;* Fills memory from start to end with specified byte value
+                            	   375: ;**************************************************************************
+00:00E003DA 61000224        	   376: CMD_FILL:	bsr	INIT_REGS
+00:00E003DE 41FA039D        	   377: 		lea.l	CMD_FILL_MSG,a0
+                            	   378: 		sys	OutStr
+00:00E003E2 4E43            	     1M                 trap    #OutStr
+                            	   379: 
+00:00E003E4 7000            	   380: 		move.l	#$00,D0
+00:00E003E6 7200            	   381: 	    	move.l	#$00,D1
+00:00E003E8 7400            	   382: 	        move.l	#$00,D2
+                            	   383: 
+00:00E003EA 41FAFD16        	   384:     		lea.l	KEYB_BUFF+2,a0
+                            	   385: 
+00:00E003EE 1410            	   386: LF1:		move.b	(a0),D2
+00:00E003F0 5248            	   387: 		add     #$01,A0
+00:00E003F2 B43C0020        	   388: 	    	cmp.b	#$20,d2
+00:00E003F6 6716            	   389: 	    	beq     LF2
+00:00E003F8 E981            	   390: 	        asl.l   #4,D1
+                            	   391: 
+00:00E003FA B43C0039        	   392: 	        CMP.B   #'9',D2
+00:00E003FE 6306            	   393: 	        BLS     LF3               ; 0-9
+00:00E00400 943C0037        	   394: 	        SUB.B   #'A'-10,D2       ; Convert A-F to 10-15
+00:00E00404 6004            	   395: 	        BRA     COMBINE_F
+                            	   396:         
+00:00E00406 943C0030        	   397: LF3:	        SUB.B   #$30,D2          ; Convert 0-9 to 0-9
+                            	   398:         
+                            	   399: COMBINE_F:
+00:00E0040A D242            	   400:        		add     D2,D1
+00:00E0040C 60E0            	   401: 	        bra     LF1
+                            	   402: 
+00:00E0040E 2241            	   403: LF2:		move.l	D1,A1		; salva indirizzo inizio dump in A1
+                            	   404: 
+                            	   405: ; legge indirizzo fine
+00:00E00410 7000            	   406: 	    	move.l	#$00,D0
+00:00E00412 7200            	   407:     		move.l	#$00,D1
+00:00E00414 7400            	   408:     		move.l	#$00,D2
+                            	   409: 
+00:00E00416 2448            	   410:     		move.l	a0,a2
+                            	   411: ;    		add     #$01,a2
+00:00E00418 1412            	   412: LF4:		move.b	(a2),D2
+00:00E0041A 524A            	   413:     		add     #$01,A2
+00:00E0041C B43C0020        	   414:     		cmp.b	#$20,d2
+00:00E00420 6716            	   415:     		beq     LF5
+00:00E00422 E981            	   416: 	        asl.l   #4,D1
+00:00E00424 B43C0039        	   417: 	        CMP.B   #'9',D2
+00:00E00428 6306            	   418: 	        BLS     LF6               ; 0-9
+00:00E0042A 943C0037        	   419: 	        SUB.B   #'A'-10,D2       ; Convert A-F to 10-15
+00:00E0042E 6004            	   420: 	        BRA     COMBINE_F2
+                            	   421:         
+00:00E00430 943C0030        	   422: LF6:            SUB.B   #$30,D2          ; Convert 0-9 to 0-9
+                            	   423:         
+                            	   424: COMBINE_F2:
+00:00E00434 D242            	   425:        		add     D2,D1
+00:00E00436 60E0            	   426:                 bra     LF4
+                            	   427: 
+00:00E00438 204A            	   428: LF5:		move.l  A2,A0
+00:00E0043A 2441            	   429:                 move.l	D1,A2	; salva indirizzo fine dump in A2
+                            	   430: 
+                            	   431: ; legge byte
+00:00E0043C 7000            	   432: 	    	move.l	#$00,D0
+00:00E0043E 7200            	   433:     		move.l	#$00,D1
+00:00E00440 7400            	   434:     		move.l	#$00,D2
+                            	   435: 
+00:00E00442 2648            	   436:     		move.l	a0,a3
+                            	   437: ;    		add     #$01,a3
+00:00E00444 1413            	   438: LFF4:		move.b	(a3),D2
+00:00E00446 524B            	   439:     		add     #$01,A3
+00:00E00448 4A02            	   440:     		cmp.b	#$00,d2
+00:00E0044A 671C            	   441:     		beq     LFF5
+00:00E0044C B43C0020        	   442:     		cmp.b	#$20,d2
+00:00E00450 6716            	   443:     		beq     LFF5
+00:00E00452 E981            	   444: 	        asl.l   #4,D1
+00:00E00454 B43C0039        	   445: 	        CMP.B   #'9',D2
+00:00E00458 6306            	   446: 	        BLS     LFF6               ; 0-9
+00:00E0045A 943C0037        	   447: 	        SUB.B   #'A'-10,D2       ; Convert A-F to 10-15
+00:00E0045E 6004            	   448: 	        BRA     COMBINE_F3
+                            	   449:         
+00:00E00460 943C0030        	   450: LFF6:           SUB.B   #$30,D2          ; Convert 0-9 to 0-9
+                            	   451:         
+                            	   452: COMBINE_F3:
+00:00E00464 D242            	   453:        		add     D2,D1
+00:00E00466 60DC            	   454:                 bra     LFF4
+                            	   455: 
+00:00E00468 2801            	   456: LFF5:		move.l	D1,D4	; salva fill byte in D4
+                            	   457: 
+                            	   458: ;inizio memory fill
+                            	   459: 
+00:00E0046A 1284            	   460: F_START:	move.b	D4,(A1)
+00:00E0046C B5C9            	   461:                 cmp.l   A1,A2
+00:00E0046E 6704            	   462:                 beq     F_END
+00:00E00470 5249            	   463:                 add     #$01,A1
+00:00E00472 60F6            	   464: 	        bra     F_START
+                            	   465: 
+00:00E00474 6000FD10        	   466: F_END		bra     MAIN_LOOP
+                            	   467: 
+                            	   468: ;**************************************************************************
+                            	   469: ;* Command: Copy Memory (c)
+                            	   470: ;* Syntax: c <from_addr_start> <from_addr_end> <to_addr_start>
+                            	   471: ;* Copies memory from source to destination for specified length
+                            	   472: ;**************************************************************************
+00:00E00478 61000186        	   473: CMD_COPY:	bsr	INIT_REGS
+00:00E0047C 41FA0310        	   474: 		lea.l	CMD_COPY_MSG,a0
+                            	   475: 		sys	OutStr
+00:00E00480 4E43            	     1M                 trap    #OutStr
+                            	   476: 
+00:00E00482 7000            	   477: 		move.l	#$00,D0
+00:00E00484 7200            	   478: 	    	move.l	#$00,D1
+00:00E00486 7400            	   479:         	move.l	#$00,D2
+                            	   480: 
+00:00E00488 41FAFC78        	   481:     		lea.l	KEYB_BUFF+2,a0
+                            	   482: 
+00:00E0048C 1410            	   483: LC1:		move.b	(a0),D2
+00:00E0048E 5248            	   484: 		add	#$01,A0
+00:00E00490 B43C0020        	   485: 	    	cmp.b	#$20,d2
+00:00E00494 6716            	   486: 	    	beq	LC2
+00:00E00496 E981            	   487: 	        asl.l   #4,D1
+                            	   488: 
+00:00E00498 B43C0039        	   489: 	        CMP.B   #'9',D2
+00:00E0049C 6306            	   490: 	        BLS     LC3               ; 0-9
+00:00E0049E 943C0037        	   491: 	        SUB.B   #'A'-10,D2       ; Convert A-F to 10-15
+00:00E004A2 6004            	   492: 	        BRA     COMBINE_C
+                            	   493:         
+00:00E004A4 943C0030        	   494: LC3:		SUB.B   #$30,D2          ; Convert 0-9 to 0-9
+                            	   495:         
+                            	   496: COMBINE_C:
+00:00E004A8 D242            	   497:        		add     D2,D1
+00:00E004AA 60E0            	   498: 	 	bra     LC1
+                            	   499: 
+00:00E004AC 2241            	   500: LC2:		move.l	D1,A1		; salva indirizzo inizio dump in A1
+                            	   501: 
+                            	   502: ; legge indirizzo fine
+00:00E004AE 7000            	   503: 	    	move.l	#$00,D0
+00:00E004B0 7200            	   504:     		move.l	#$00,D1
+00:00E004B2 7400            	   505:     		move.l	#$00,D2
+                            	   506: 
+00:00E004B4 2448            	   507:     		move.l	a0,a2
+                            	   508: ;    		add	#$01,a2
+00:00E004B6 1412            	   509: LC4:		move.b	(a2),D2
+00:00E004B8 524A            	   510:     		add	#$01,A2
+00:00E004BA B43C0020        	   511:     		cmp.b	#$20,d2
+00:00E004BE 6716            	   512:     		beq	LC5
+00:00E004C0 E981            	   513: 	        asl.l   #4,D1
+00:00E004C2 B43C0039        	   514: 	        CMP.B   #'9',D2
+00:00E004C6 6306            	   515: 	        BLS     LC6               ; 0-9
+00:00E004C8 943C0037        	   516: 	        SUB.B   #'A'-10,D2       ; Convert A-F to 10-15
+00:00E004CC 6004            	   517: 	        BRA     COMBINE_C2
+                            	   518:         
+00:00E004CE 943C0030        	   519: LC6:    	SUB.B   #$30,D2          ; Convert 0-9 to 0-9
+                            	   520:         
+                            	   521: COMBINE_C2:
+00:00E004D2 D242            	   522:        		add     D2,D1
+00:00E004D4 60E0            	   523: 	 	bra     LC4
+                            	   524: 
+00:00E004D6 204A            	   525: LC5:		move.l  A2,A0
+00:00E004D8 2441            	   526: 	        move.l	D1,A2	; salva indirizzo fine dump in A2
+                            	   527: 
+                            	   528: ; legge indirizzo inizio area copia
+00:00E004DA 7000            	   529: 	    	move.l	#$00,D0
+00:00E004DC 7200            	   530:     		move.l	#$00,D1
+00:00E004DE 7400            	   531:     		move.l	#$00,D2
+                            	   532: 
+00:00E004E0 2648            	   533:     		move.l	a0,a3
+                            	   534: ;    		add	#$01,a3
+00:00E004E2 1413            	   535: LCC4:		move.b	(a3),D2
+00:00E004E4 524B            	   536:     		add	#$01,A3
+00:00E004E6 4A02            	   537:     		cmp.b	#$00,d2
+00:00E004E8 671C            	   538:     		beq	LCC5
+00:00E004EA B43C0020        	   539:     		cmp.b	#$20,d2
+00:00E004EE 6716            	   540:     		beq	LCC5
+00:00E004F0 E981            	   541: 	        asl.l   #4,D1
+00:00E004F2 B43C0039        	   542: 	        CMP.B   #'9',D2
+00:00E004F6 6306            	   543: 	        BLS     LCC6               ; 0-9
+00:00E004F8 943C0037        	   544: 	        SUB.B   #'A'-10,D2       ; Convert A-F to 10-15
+00:00E004FC 6004            	   545: 	        BRA     COMBINE_C3
+                            	   546:         
+00:00E004FE 943C0030        	   547: LCC6:   	SUB.B   #$30,D2          ; Convert 0-9 to 0-9
+                            	   548:         
+                            	   549: COMBINE_C3:
+00:00E00502 D242            	   550:        		add     D2,D1
+00:00E00504 60DC            	   551: 		bra     LCC4
+                            	   552: 
+00:00E00506 2641            	   553: LCC5:		move.l	D1,A3	; salva copy byte in A3
+                            	   554: 
+                            	   555: ;inizio memory fill
+                            	   556: 
+00:00E00508 1691            	   557: C_START:	move.b	(A1),(A3)
+00:00E0050A B5C9            	   558:             	cmp.l   A1,A2
+00:00E0050C 6706            	   559:          	beq     C_END
+00:00E0050E 5249            	   560: 		add     #$01,A1
+00:00E00510 524B            	   561:       	        add     #$01,A3
+00:00E00512 60F4            	   562: 	        bra     C_START
+                            	   563: 
+00:00E00514 6000FC70        	   564: C_END		bra     MAIN_LOOP
+                            	   565: 
+                            	   566: ;**************************************************************************
+                            	   567: ;* Command: Insert/Modify Memory (i)
+                            	   568: ;* Syntax: i <address> <value1> [value2 ... value16]
+                            	   569: ;* Modifies memory starting at address with specified values
+                            	   570: ;**************************************************************************
+00:00E00518 610000E6        	   571: CMD_INSERT:	bsr	INIT_REGS
+00:00E0051C 41FA0281        	   572: 		lea.l	CMD_INSERT_MSG,a0
+                            	   573: 		sys	OutStr
+00:00E00520 4E43            	     1M                 trap    #OutStr
+                            	   574: 
+00:00E00522 7000            	   575: 		move.l	#$00,D0
+00:00E00524 7200            	   576: 	    	move.l	#$00,D1
+00:00E00526 7400            	   577:     	        move.l	#$00,D2
+                            	   578: 
+00:00E00528 41FAFBD8        	   579:     		lea.l	KEYB_BUFF+2,a0
+                            	   580: 
+00:00E0052C 1410            	   581: LI1:		move.b	(a0),D2
+00:00E0052E 5248            	   582: 		add	#$01,A0
+00:00E00530 B43C0020        	   583: 	    	cmp.b	#$20,d2
+00:00E00534 6716            	   584: 	    	beq	LI2
+00:00E00536 E981            	   585: 	        asl.l   #4,D1
+                            	   586: 
+00:00E00538 B43C0039        	   587: 	        CMP.B   #'9',D2
+00:00E0053C 6306            	   588: 	        BLS     LI3               ; 0-9
+00:00E0053E 943C0037        	   589: 	        SUB.B   #'A'-10,D2       ; Convert A-F to 10-15
+00:00E00542 6004            	   590: 	        BRA     COMBINE_I
+                            	   591:         
+00:00E00544 943C0030        	   592: LI3:	    	SUB.B   #$30,D2          ; Convert 0-9 to 0-9
+                            	   593:         
+                            	   594: COMBINE_I:
+00:00E00548 D242            	   595:        		add     D2,D1
+00:00E0054A 60E0            	   596:     	    	bra     LI1
+                            	   597: 
+00:00E0054C 2241            	   598: LI2:		move.l	D1,A1		; salva indirizzo inizio dump in A1
+                            	   599: 
+                            	   600: ; legge byte
+00:00E0054E 2448            	   601:     		move.l	a0,a2
+00:00E00550 7600            	   602:             	move.l  #$00,D3
+00:00E00552 7000            	   603: I_START:   	move.l	#$00,D0
+00:00E00554 7200            	   604:     		move.l	#$00,D1
+00:00E00556 7400            	   605:     		move.l	#$00,D2
+                            	   606: 
+00:00E00558 1412            	   607: LI4:		move.b	(a2),D2
+00:00E0055A 524A            	   608:     		add	#$01,A2
+00:00E0055C B43C0020        	   609:     		cmp.b	#$20,d2
+00:00E00560 671A            	   610:     		beq	LI5
+00:00E00562 4A02            	   611:     		cmp.b	#$00,d2
+00:00E00564 6728            	   612:     		beq	I_END
+00:00E00566 E981            	   613: 	        asl.l   #4,D1
+00:00E00568 B43C0039        	   614: 	        CMP.B   #'9',D2
+00:00E0056C 6306            	   615: 	        BLS     LI6               ; 0-9
+00:00E0056E 943C0037        	   616: 	        SUB.B   #'A'-10,D2       ; Convert A-F to 10-15
+00:00E00572 6004            	   617: 	        BRA     COMBINE_I2
+                            	   618:         
+00:00E00574 943C0030        	   619: LI6:        	SUB.B   #$30,D2          ; Convert 0-9 to 0-9
+                            	   620:         
+                            	   621: COMBINE_I2:
+00:00E00578 D242            	   622:        		add     D2,D1
+                            	   623: 
+00:00E0057A 60DC            	   624:     	    	bra     LI4
+                            	   625: 
+00:00E0057C 5243            	   626: LI5:		addq    #$01,d3
+00:00E0057E B6BC0000000F    	   627:             	cmp.l   #$0F,d3
+00:00E00584 6E0E            	   628:             	bgt     I_ERROR
+00:00E00586 2801            	   629:             	move.l  D1,D4   ; salva byte in D4
+                            	   630: 
+                            	   631: ;stampa da inizio a fine il dump su righe di 16 byte
+                            	   632: 
+00:00E00588 1284            	   633: 		move.b	d4,(a1)
+00:00E0058A 5249            	   634:             	add     #$01,a1
+00:00E0058C 60C4            	   635:             	bra     I_START
+                            	   636: 
+00:00E0058E 1281            	   637: I_END		move.b  d1,(a1)
+00:00E00590 6000FBF4        	   638: 		bra	MAIN_LOOP
+                            	   639: 
+00:00E00594 41FA0008        	   640: I_ERROR     	lea.l	I_ERR_MSG,a0
+                            	   641: 		sys	OutStr
+00:00E00598 4E43            	     1M                 trap    #OutStr
+00:00E0059A 6000FBEA        	   642: 		bra	MAIN_LOOP
+                            	   643: 
+00:00E0059E 0A496E7365727420	   644: I_ERR_MSG	dc.b    '\nInsert error: too many arguments\nOnly 16 bytes are saved!\n',0
+00:00E005A6 6572726F723A2074
+00:00E005AE 6F6F206D616E7920
+00:00E005B6 617267756D656E74
+00:00E005BE 730A4F6E6C792031
+00:00E005C6 3620627974657320
+00:00E005CE 6172652073617665
+00:00E005D6 64210A
+00:00E005D9 00
+                            	   645: 
+                            	   646: 
+                            	   647: ;**************************************************************************
+                            	   648: ;* Command: Exit monitor (q)
+                            	   649: ;* Syntax: q
+                            	   650: ;* Exit monitor application and returns to the system
+                            	   651: ;**************************************************************************
+00:00E005DA 41FA01D6        	   652: CMD_EXIT:	lea.l	CMD_EXIT_MSG,a0
+                            	   653: 		sys	OutStr
+00:00E005DE 4E43            	     1M                 trap    #OutStr
+                            	   654: 	        sys     Exit
+00:00E005E0 4E40            	     1M                 trap    #Exit
+                            	   655: 
+                            	   656: 
+                            	   657: ;**************************************************************************
+                            	   658: ;* Command: Help (?)
+                            	   659: ;* Syntax: ?
+                            	   660: ;* Print help
+                            	   661: ;**************************************************************************
+00:00E005E2 611C            	   662: CMD_HELP:	bsr	INIT_REGS
+00:00E005E4 41FA01F0        	   663: 		lea.l	CMD_HELP_MSG,a0
+                            	   664: 		sys	OutStr
+00:00E005E8 4E43            	     1M                 trap    #OutStr
+00:00E005EA 6000FB9A        	   665: 	        bra     MAIN_LOOP
+                            	   666: 
+                            	   667: 
+                            	   668: 
+                            	   669: ;**************************************************
+                            	   670: ; Convert character in D0 to uppercase
+                            	   671: ;**************************************************
+                            	   672: TO_UPPER:
+00:00E005EE B03C0061        	   673:         CMP.B   #'a',D0
+00:00E005F2 650A            	   674:         BLO     TO_UPPER_DONE
+00:00E005F4 B03C007A        	   675:         CMP.B   #'z',D0
+00:00E005F8 6204            	   676:         BHI     TO_UPPER_DONE
+00:00E005FA 903C0020        	   677:         SUB.B   #$20,D0         ; Convert to uppercase
+                            	   678:         
+                            	   679: TO_UPPER_DONE:
+00:00E005FE 4E75            	   680:         RTS
+                            	   681: 
+                            	   682: ;*************************************************
+                            	   683: ; Initialize all cpu registers
+                            	   684: ;*************************************************
+                            	   685: INIT_REGS:
+00:00E00600 91C8            	   686: 	move.l #$00,A0
+00:00E00602 93C9            	   687: 	move.l #$00,A1
+00:00E00604 95CA            	   688: 	move.l #$00,A2
+00:00E00606 97CB            	   689: 	move.l #$00,A3
+00:00E00608 99CC            	   690: 	move.l #$00,A4
+00:00E0060A 9BCD            	   691: 	move.l #$00,A5
+00:00E0060C 9DCE            	   692: 	move.l #$00,A6
+                            	   693: 
+00:00E0060E 7000            	   694: 	move.l #$00,D0
+00:00E00610 7200            	   695: 	move.l #$00,D1
+00:00E00612 7400            	   696: 	move.l #$00,D2
+00:00E00614 7600            	   697: 	move.l #$00,D3
+00:00E00616 7800            	   698: 	move.l #$00,D4
+00:00E00618 7A00            	   699: 	move.l #$00,D5
+00:00E0061A 7C00            	   700: 	move.l #$00,D6
+00:00E0061C 7E00            	   701: 	move.l #$00,D7
+                            	   702: 
+00:00E0061E 4E75            	   703: 	RTS
+                            	   704: 
+                            	   705: 
+                            	   706: ;**************************************************************************
+                            	   707: ;* Data Section
+                            	   708: ;**************************************************************************
+                            	   709: INIT_MESSAGE:
+00:00E00620 4D3638303030204D	   710:         DC.B    "M68000 Monitor v1.4    (renzo@iol.it)  -  09 Nov 2025\n"
+00:00E00628 6F6E69746F722076
+00:00E00630 312E342020202028
+00:00E00638 72656E7A6F40696F
+00:00E00640 6C2E69742920202D
+00:00E00648 20203039204E6F76
+00:00E00650 20323032350A
+00:00E00656 436F6D6D616E6473	   711: 	DC.B	"Commands: x,d,(r),g,e,f,c,i,q\n"
+00:00E0065E 3A20782C642C2872
+00:00E00666 292C672C652C662C
+00:00E0066E 632C692C710A
+00:00E00674 2020707265737320	   712: 	DC.B	"  press ? for help\n",0
+00:00E0067C 3F20666F72206865
+00:00E00684 6C700A
+00:00E00687 00
+                            	   713: 
+                            	   714: PROMPT:
+00:00E00688 0A3E20          	   715:         DC.B    "\n> ",0
+00:00E0068B 00
+                            	   716: 
+                            	   717: UNKNOWN_CMD:
+00:00E0068C 0A556E6B6E6F776E	   718:         DC.B    "\nUnknown command\n",0
+00:00E00694 20636F6D6D616E64
+00:00E0069C 0A
+00:00E0069D 00
+                            	   719: 
+                            	   720: REGS_MESSAGE:
+00:00E0069E 5265676973746572	   721:         DC.B    "Registers:\n",0
+00:00E006A6 733A0A
+00:00E006A9 00
+                            	   722: 
+                            	   723: GO_MESSAGE:
+00:00E006AA 457865637574696E	   724:         DC.B    "Executing at address ",0
+00:00E006B2 6720617420616464
+00:00E006BA 7265737320
+00:00E006BF 00
+                            	   725: 
+                            	   726: GOSUB_MESSAGE:
+00:00E006C0 457865637574696E	   727:         DC.B    "Executing subroutine at address ",0
+00:00E006C8 6720737562726F75
+00:00E006D0 74696E6520617420
+00:00E006D8 6164647265737320
+00:00E006E0 00
+                            	   728: 
+                            	   729: FILL_DONE_MSG:
+00:00E006E1 4D656D6F72792066	   730:         DC.B    "Memory filled\n",0
+00:00E006E9 696C6C65640A
+00:00E006EF 00
+                            	   731: 
+                            	   732: COPY_DONE_MSG:
+00:00E006F0 4D656D6F72792063	   733:         DC.B    "Memory copied\n",0
+00:00E006F8 6F706965640A
+00:00E006FE 00
+                            	   734: 
+                            	   735: INSERT_DONE_MSG:
+00:00E006FF 4D656D6F7279206D	   736:         DC.B    "Memory modified\n",0
+00:00E00707 6F6469666965640A
+00:00E0070F 00
+                            	   737: 
+                            	   738: CMD_EXAMINE_MSG:
+00:00E00710 0A783D6578616D69	   739: 	dc.b	"\nx=examine command\n",0
+00:00E00718 6E6520636F6D6D61
+00:00E00720 6E640A
+00:00E00723 00
+                            	   740: 
+                            	   741: CMD_DUMP_MSG:
+00:00E00724 0A643D64756D7020	   742: 	dc.b	"\nd=dump command\n",0
+00:00E0072C 636F6D6D616E640A
+00:00E00734 00
+                            	   743: 
+                            	   744: CMD_REGISTERS_MSG:
+00:00E00735 0A723D7265676973	   745: 	dc.b	"\nr=register command\n",0
+00:00E0073D 74657220636F6D6D
+00:00E00745 616E640A
+00:00E00749 00
+                            	   746: 
+                            	   747: CMD_GO_MSG:
+00:00E0074A 0A673D6578656375	   748: 	dc.b	"\ng=execute command\n",0
+00:00E00752 746520636F6D6D61
+00:00E0075A 6E640A
+00:00E0075D 00
+                            	   749: 
+                            	   750: CMD_GOSUB_MSG:
+00:00E0075E 0A653D6578656375	   751: 	dc.b	"\ne=execute subroutine command\n",0
+00:00E00766 746520737562726F
+00:00E0076E 7574696E6520636F
+00:00E00776 6D6D616E640A
+00:00E0077C 00
+                            	   752: 
+                            	   753: CMD_FILL_MSG:
+00:00E0077D 0A663D66696C6C20	   754: 	dc.b	"\nf=fill command\n",0
+00:00E00785 636F6D6D616E640A
+00:00E0078D 00
+                            	   755: 
+                            	   756: CMD_COPY_MSG:
+00:00E0078E 0A633D636F707920	   757: 	dc.b	"\nc=copy command\n",0
+00:00E00796 636F6D6D616E640A
+00:00E0079E 00
+                            	   758: 
+                            	   759: CMD_INSERT_MSG:
+00:00E0079F 0A693D696E736572	   760: 	dc.b	"\ni=insert command\n",0
+00:00E007A7 7420636F6D6D616E
+00:00E007AF 640A
+00:00E007B1 00
+                            	   761: 
+                            	   762: CMD_EXIT_MSG:
+00:00E007B2 0A0A204578697420	   763: 	dc.b	"\n\n Exit Monitor\n             Bye!\n\n",0
+00:00E007BA 4D6F6E69746F720A
+00:00E007C2 2020202020202020
+00:00E007CA 2020202020427965
+00:00E007D2 210A0A
+00:00E007D5 00
+                            	   764: 
+                            	   765: CMD_HELP_MSG:
+00:00E007D6 0A0A436F6D6D616E	   766: 	dc.b	"\n\nCommands:\n"
+00:00E007DE 64733A0A
+00:00E007E2 78203C6164647265	   767: 	dc.b	"x <address>					Displays the contents of the specified memory <address>\n"
+00:00E007EA 73733E0909090909
+00:00E007F2 446973706C617973
+00:00E007FA 2074686520636F6E
+00:00E00802 74656E7473206F66
+00:00E0080A 2074686520737065
+00:00E00812 636966696564206D
+00:00E0081A 656D6F7279203C61
+00:00E00822 6464726573733E0A
+00:00E0082A 64203C7374617274	   768: 	dc.b	"d <start> <end>					Dumps memory from <start> to <end> address, 16 bytes per line\n"
+00:00E00832 3E203C656E643E09
+00:00E0083A 0909090944756D70
+00:00E00842 73206D656D6F7279
+00:00E0084A 2066726F6D203C73
+00:00E00852 746172743E20746F
+00:00E0085A 203C656E643E2061
+00:00E00862 6464726573732C20
+00:00E0086A 3136206279746573
+00:00E00872 20706572206C696E
+00:00E0087A 650A
+00:00E0087C 7209090909090944	   769: 	dc.b	"r						Displays the contents of all CPU registers\n"
+00:00E00884 6973706C61797320
+00:00E0088C 74686520636F6E74
+00:00E00894 656E7473206F6620
+00:00E0089C 616C6C2043505520
+00:00E008A4 7265676973746572
+00:00E008AC 730A
+00:00E008AE 67203C6164647265	   770: 	dc.b	"g <address>					Begins execution at the specified <address>\n"
+00:00E008B6 73733E0909090909
+00:00E008BE 426567696E732065
+00:00E008C6 7865637574696F6E
+00:00E008CE 2061742074686520
+00:00E008D6 7370656369666965
+00:00E008DE 64203C6164647265
+00:00E008E6 73733E0A
+00:00E008EA 65203C6164647265	   771:         dc.b	"e <address>					Execute subroutine at the specified <address> and return to monitor\n"
+00:00E008F2 73733E0909090909
+00:00E008FA 4578656375746520
+00:00E00902 737562726F757469
+00:00E0090A 6E65206174207468
+00:00E00912 6520737065636966
+00:00E0091A 696564203C616464
+00:00E00922 726573733E20616E
+00:00E0092A 642072657475726E
+00:00E00932 20746F206D6F6E69
+00:00E0093A 746F720A
+00:00E0093E 66203C7374617274	   772: 	dc.b	"f <start> <end> <byte>				Fills memory from <start> address to <end> address with specified <byte> value\n"
+00:00E00946 3E203C656E643E20
+00:00E0094E 3C627974653E0909
+00:00E00956 090946696C6C7320
+00:00E0095E 6D656D6F72792066
+00:00E00966 726F6D203C737461
+00:00E0096E 72743E2061646472
+00:00E00976 65737320746F203C
+00:00E0097E 656E643E20616464
+00:00E00986 7265737320776974
+00:00E0098E 6820737065636966
+00:00E00996 696564203C627974
+00:00E0099E 653E2076616C7565
+00:00E009A6 0A
+00:00E009A7 63203C66726F6D5F	   773: 	dc.b	"c <from_addr_start> <from_addr_end> <to_addr_start>	Copies memory from source to destination for specified lengt
+00:00E009AF 616464725F737461
+00:00E009B7 72743E203C66726F
+00:00E009BF 6D5F616464725F65
+00:00E009C7 6E643E203C746F5F
+00:00E009CF 616464725F737461
+00:00E009D7 72743E09436F7069
+00:00E009DF 6573206D656D6F72
+00:00E009E7 792066726F6D2073
+00:00E009EF 6F7572636520746F
+00:00E009F7 2064657374696E61
+00:00E009FF 74696F6E20666F72
+00:00E00A07 2073706563696669
+00:00E00A0F 6564206C656E6774
+00:00E00A17 680A
+00:00E00A19 69203C6164647265	   774: 	dc.b	"i <address> <value1> [value2 ... value16]	Modifies memory starting at address with specified values\n"
+00:00E00A21 73733E203C76616C
+00:00E00A29 7565313E205B7661
+00:00E00A31 6C756532202E2E2E
+00:00E00A39 2076616C75653136
+00:00E00A41 5D094D6F64696669
+00:00E00A49 6573206D656D6F72
+00:00E00A51 7920737461727469
+00:00E00A59 6E67206174206164
+00:00E00A61 6472657373207769
+00:00E00A69 7468207370656369
+00:00E00A71 666965642076616C
+00:00E00A79 7565730A
+00:00E00A7D 7109090909090945	   775: 	dc.b	"q						Exit Monitor and returns to the system\n"
+00:00E00A85 786974204D6F6E69
+00:00E00A8D 746F7220616E6420
+00:00E00A95 72657475726E7320
+00:00E00A9D 746F207468652073
+00:00E00AA5 797374656D0A
+00:00E00AAB 3F09090909090950	   776: 	dc.b	"?						Print this command list\n\n"
+00:00E00AB3 72696E7420746869
+00:00E00ABB 7320636F6D6D616E
+00:00E00AC3 64206C6973740A0A
+00:00E00ACB 7768657265203C61	   777: 	dc.b	"where <address> is hex number from 000000 to FFFFFF; <byte> is hex number from 00 to FF\n\n\n",0
+00:00E00AD3 6464726573733E20
+00:00E00ADB 697320686578206E
+00:00E00AE3 756D626572206672
+00:00E00AEB 6F6D203030303030
+00:00E00AF3 3020746F20464646
+00:00E00AFB 4646463B203C6279
+00:00E00B03 74653E2069732068
+00:00E00B0B 6578206E756D6265
+00:00E00B13 722066726F6D2030
+00:00E00B1B 3020746F2046460A
+00:00E00B23 0A0A
+00:00E00B25 00
+                            	   778: 
+00:00E00B26 20              	   779: SPACE:	dc.b	" ",0
+00:00E00B27 00
+00:00E00B28 0A              	   780: ACAPO:	dc.b	"\n",0
+00:00E00B29 00
+                            	   781: 
+                            	   782: 
+                            	   783: 
+                            	   784: ;**************************************************************************
+                            	   785: ;* End of Monitor Program
+                            	   786: ;**************************************************************************
+
+
+Symbols by name:
+ACAPO                            A:00E00B28
+APPMEMSTART                      E:00E00100
+CAPS1                            A:00E0019E
+CF_COMMAND                       E:0000000F
+CF_COUNT                         E:00000005
+CF_CYLH                          E:0000000B
+CF_CYLL                          E:00000009
+CF_DRIVEHEAD                     E:0000000D
+CF_ERROR                         E:00000003
+CF_FEATURE                       E:00000003
+CF_LBA0                          E:00000007
+CF_LBA1                          E:00000009
+CF_LBA2                          E:0000000B
+CF_LBA3                          E:0000000D
+CF_SECTOR                        E:00000007
+CF_STATUS                        E:0000000F
+CHK_MENU                         A:00E001AE
+CMD_COPY                         A:00E00478
+CMD_COPY_MSG                     A:00E0078E
+CMD_DUMP                         A:00E0026C
+CMD_DUMP_MSG                     A:00E00724
+CMD_EXAMINE                      A:00E0020E
+CMD_EXAMINE_MSG                  A:00E00710
+CMD_EXIT                         A:00E005DA
+CMD_EXIT_MSG                     A:00E007B2
+CMD_FILL                         A:00E003DA
+CMD_FILL_MSG                     A:00E0077D
+CMD_GO                           A:00E0035E
+CMD_GOSUB                        A:00E0039A
+CMD_GOSUB_MSG                    A:00E0075E
+CMD_GO_MSG                       A:00E0074A
+CMD_HELP                         A:00E005E2
+CMD_HELP_MSG                     A:00E007D6
+CMD_INSERT                       A:00E00518
+CMD_INSERT_MSG                   A:00E0079F
+CMD_REGISTERS                    A:00E00354
+CMD_REGISTERS_MSG                A:00E00735
+COMBINE                          A:00E00248
+COMBINE_C                        A:00E004A8
+COMBINE_C2                       A:00E004D2
+COMBINE_C3                       A:00E00502
+COMBINE_D                        A:00E002A8
+COMBINE_D2                       A:00E002D6
+COMBINE_E                        A:00E003CE
+COMBINE_F                        A:00E0040A
+COMBINE_F2                       A:00E00434
+COMBINE_F3                       A:00E00464
+COMBINE_G                        A:00E00392
+COMBINE_I                        A:00E00548
+COMBINE_I2                       A:00E00578
+COPY_DONE_MSG                    A:00E006F0
+C_END                            A:00E00514
+C_START                          A:00E00508
+DUMP_HEAD                        A:00E00314
+D_END                            A:00E0030A
+D_PR_BYTE                        A:00E002EC
+D_START                          A:00E002DE
+Exit                             E:00000000
+FILL_DONE_MSG                    A:00E006E1
+FMT_BASE                         E:000000E0
+FMT_H32                          E:000000E5
+FMT_H8                           E:000000E3
+FSVARSTART                       E:00E00010
+F_END                            A:00E00474
+F_START                          A:00E0046A
+GOSUB_MESSAGE                    A:00E006C0
+GO_MESSAGE                       A:00E006AA
+INIT_MESSAGE                     A:00E00620
+INIT_REGS                        A:00E00600
+INPUTBUFLEN                      E:00000040
+INSERT_DONE_MSG                  A:00E006FF
+ISR                              E:00000004
+I_END                            A:00E0058E
+I_ERROR                          A:00E00594
+I_ERR_MSG                        A:00E0059E
+I_START                          A:00E00552
+KEYB_BUFF                        A:00E00100
+LC1                              A:00E0048C
+LC2                              A:00E004AC
+LC3                              A:00E004A4
+LC4                              A:00E004B6
+LC5                              A:00E004D6
+LC6                              A:00E004CE
+LCC4                             A:00E004E2
+LCC5                             A:00E00506
+LCC6                             A:00E004FE
+LD1                              A:00E0028C
+LD2                              A:00E002AC
+LD3                              A:00E002A4
+LD4                              A:00E002B6
+LD5                              A:00E002DA
+LD6                              A:00E002D2
+LE1                              A:00E003AE
+LE2                              A:00E003D2
+LE3                              A:00E003CA
+LF1                              A:00E003EE
+LF2                              A:00E0040E
+LF3                              A:00E00406
+LF4                              A:00E00418
+LF5                              A:00E00438
+LF6                              A:00E00430
+LFF4                             A:00E00444
+LFF5                             A:00E00468
+LFF6                             A:00E00460
+LG1                              A:00E00372
+LG2                              A:00E00396
+LG3                              A:00E0038E
+LI1                              A:00E0052C
+LI2                              A:00E0054C
+LI3                              A:00E00544
+LI4                              A:00E00558
+LI5                              A:00E0057C
+LI6                              A:00E00574
+LX1                              A:00E00228
+LX2                              A:00E0024C
+LX3                              A:00E00244
+MAIN_LOOP                        A:00E00186
+OutFmt                           E:00000004
+OutStr                           E:00000003
+PARTSIZE                         E:00E00010
+PROMPT                           A:00E00688
+PRbNOCTRLCHARS                   E:00000009
+PRbNOECHO                        E:00000008
+PromptStr                        E:00000006
+RAM                              E:00E00000
+RAMEND                           E:00F00000
+RAMSIZE                          E:00100000
+REGS_MESSAGE                     A:00E0069E
+REG_A0                           A:00E00160
+REG_A1                           A:00E00164
+REG_A2                           A:00E00168
+REG_A3                           A:00E0016C
+REG_A4                           A:00E00170
+REG_A5                           A:00E00174
+REG_A6                           A:00E00178
+REG_A7                           A:00E0017C
+REG_D0                           A:00E00140
+REG_D1                           A:00E00144
+REG_D2                           A:00E00148
+REG_D3                           A:00E0014C
+REG_D4                           A:00E00150
+REG_D5                           A:00E00154
+REG_D6                           A:00E00158
+REG_D7                           A:00E0015C
+RHR                              E:00000000
+SECTORSIZE                       E:00000200
+SEPARATORS                       E:00E0000C
+SPACE                            A:00E00B26
+SPR                              E:0000000E
+SR_C                             E:00000000
+SR_N                             E:00000003
+SR_V                             E:00000001
+SR_X                             E:00000004
+SR_Z                             E:00000002
+START                            A:00E00180
+SYSMEMSIZE                       E:00000100
+SYSMEMSTART                      E:00E00000
+TO_UPPER                         A:00E005EE
+TO_UPPER_DONE                    A:00E005FE
+UNKNOWN_CMD                      A:00E0068C
+VOLNAME                          E:00E0002E
+ad_fmtstr                        A:00E0034E
+da_fmtstr                        A:00E00351
+x_fmtstr                         A:00E00262
+
+Symbols by value:
+00000000 RHR
+00000000 SR_C
+00000000 Exit
+00000001 SR_V
+00000002 SR_Z
+00000003 SR_N
+00000003 CF_FEATURE
+00000003 CF_ERROR
+00000003 OutStr
+00000004 SR_X
+00000004 ISR
+00000004 OutFmt
+00000005 CF_COUNT
+00000006 PromptStr
+00000007 CF_SECTOR
+00000007 CF_LBA0
+00000008 PRbNOECHO
+00000009 CF_CYLL
+00000009 PRbNOCTRLCHARS
+00000009 CF_LBA1
+0000000B CF_LBA2
+0000000B CF_CYLH
+0000000D CF_LBA3
+0000000D CF_DRIVEHEAD
+0000000E SPR
+0000000F CF_COMMAND
+0000000F CF_STATUS
+00000040 INPUTBUFLEN
+000000E0 FMT_BASE
+000000E3 FMT_H8
+000000E5 FMT_H32
+00000100 SYSMEMSIZE
+00000200 SECTORSIZE
+00100000 RAMSIZE
+00E00000 SYSMEMSTART
+00E00000 RAM
+00E0000C SEPARATORS
+00E00010 FSVARSTART
+00E00010 PARTSIZE
+00E0002E VOLNAME
+00E00100 KEYB_BUFF
+00E00100 APPMEMSTART
+00E00140 REG_D0
+00E00144 REG_D1
+00E00148 REG_D2
+00E0014C REG_D3
+00E00150 REG_D4
+00E00154 REG_D5
+00E00158 REG_D6
+00E0015C REG_D7
+00E00160 REG_A0
+00E00164 REG_A1
+00E00168 REG_A2
+00E0016C REG_A3
+00E00170 REG_A4
+00E00174 REG_A5
+00E00178 REG_A6
+00E0017C REG_A7
+00E00180 START
+00E00186 MAIN_LOOP
+00E0019E CAPS1
+00E001AE CHK_MENU
+00E0020E CMD_EXAMINE
+00E00228 LX1
+00E00244 LX3
+00E00248 COMBINE
+00E0024C LX2
+00E00262 x_fmtstr
+00E0026C CMD_DUMP
+00E0028C LD1
+00E002A4 LD3
+00E002A8 COMBINE_D
+00E002AC LD2
+00E002B6 LD4
+00E002D2 LD6
+00E002D6 COMBINE_D2
+00E002DA LD5
+00E002DE D_START
+00E002EC D_PR_BYTE
+00E0030A D_END
+00E00314 DUMP_HEAD
+00E0034E ad_fmtstr
+00E00351 da_fmtstr
+00E00354 CMD_REGISTERS
+00E0035E CMD_GO
+00E00372 LG1
+00E0038E LG3
+00E00392 COMBINE_G
+00E00396 LG2
+00E0039A CMD_GOSUB
+00E003AE LE1
+00E003CA LE3
+00E003CE COMBINE_E
+00E003D2 LE2
+00E003DA CMD_FILL
+00E003EE LF1
+00E00406 LF3
+00E0040A COMBINE_F
+00E0040E LF2
+00E00418 LF4
+00E00430 LF6
+00E00434 COMBINE_F2
+00E00438 LF5
+00E00444 LFF4
+00E00460 LFF6
+00E00464 COMBINE_F3
+00E00468 LFF5
+00E0046A F_START
+00E00474 F_END
+00E00478 CMD_COPY
+00E0048C LC1
+00E004A4 LC3
+00E004A8 COMBINE_C
+00E004AC LC2
+00E004B6 LC4
+00E004CE LC6
+00E004D2 COMBINE_C2
+00E004D6 LC5
+00E004E2 LCC4
+00E004FE LCC6
+00E00502 COMBINE_C3
+00E00506 LCC5
+00E00508 C_START
+00E00514 C_END
+00E00518 CMD_INSERT
+00E0052C LI1
+00E00544 LI3
+00E00548 COMBINE_I
+00E0054C LI2
+00E00552 I_START
+00E00558 LI4
+00E00574 LI6
+00E00578 COMBINE_I2
+00E0057C LI5
+00E0058E I_END
+00E00594 I_ERROR
+00E0059E I_ERR_MSG
+00E005DA CMD_EXIT
+00E005E2 CMD_HELP
+00E005EE TO_UPPER
+00E005FE TO_UPPER_DONE
+00E00600 INIT_REGS
+00E00620 INIT_MESSAGE
+00E00688 PROMPT
+00E0068C UNKNOWN_CMD
+00E0069E REGS_MESSAGE
+00E006AA GO_MESSAGE
+00E006C0 GOSUB_MESSAGE
+00E006E1 FILL_DONE_MSG
+00E006F0 COPY_DONE_MSG
+00E006FF INSERT_DONE_MSG
+00E00710 CMD_EXAMINE_MSG
+00E00724 CMD_DUMP_MSG
+00E00735 CMD_REGISTERS_MSG
+00E0074A CMD_GO_MSG
+00E0075E CMD_GOSUB_MSG
+00E0077D CMD_FILL_MSG
+00E0078E CMD_COPY_MSG
+00E0079F CMD_INSERT_MSG
+00E007B2 CMD_EXIT_MSG
+00E007D6 CMD_HELP_MSG
+00E00B26 SPACE
+00E00B28 ACAPO
+00F00000 RAMEND
