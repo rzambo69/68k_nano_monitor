@@ -11,10 +11,10 @@ monitor program. My purpose is just to insert simple machine language routine in
 As said it would need optimization and some error checking routines for the typed commands and the hex numbers. It's not
 so simple for me and it requires a lot of time. Maybe in the future...
 
-IMPORTANT WWARNING: This code can be freely used and distributed. Since it is incomplete, that is it lacks many error
-                    checking routines causing possible instability and unpredictable behaviour, I WILL NOT BE RESPONSIBLE for
-                    any damage or data loss. If you intend to run it from the flash card I strongly recommend to create a 
-                    backup copy.
+IMPORTANT WARNING: This code can be freely used and distributed. Since it is incomplete, because it lacks many error
+                    checking routines causing possible instability and unpredictable behaviour, I WILL NOT BE RESPONSIBLE
+                    for any damage or data loss. If you intend to run it from the compact flash card I strongly recommend
+                    you to create a backup copy.
 
 Following pictures show some usage examples.
 
